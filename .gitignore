@@ -49,4 +49,4 @@ po/*~
 rsconnect/
 
 # rds files
-outputs/models/*.rds
+outputs/
