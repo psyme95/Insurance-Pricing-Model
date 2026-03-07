@@ -5,7 +5,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Status](https://img.shields.io/badge/status-in%20development-orange)
 
-A reproducible R pipeline for motor insurance **pure premium modelling**, built on the French Motor Third-Party Liability dataset (`freMTPL2`). The project implements the industry-standard **frequency-severity separation** approach using Poisson and Gamma GLMs, compares performance against an XGBoost Tweedie ensemble, and evaluates models using actuarially appropriate metrics including the normalised Gini coefficient and double lift chart.
+A reproducible R pipeline for motor insurance **pure premium modelling**, built on the French Motor Third-Party Liability dataset (`freMTPL2`). The project implements a **frequency-severity separation** approach using Poisson and Gamma GLMs, compares performance against an XGBoost Tweedie ensemble, and evaluates models using actuarially appropriate metrics including the normalised Gini coefficient and double lift chart.
 
 ---
 
@@ -13,16 +13,14 @@ A reproducible R pipeline for motor insurance **pure premium modelling**, built 
 
 **Source:** `CASdatasets` R package — `freMTPL2freq` (claim frequency) and `freMTPL2sev` (claim severity).
 
-This is a real-world dataset widely used in actuarial science education and research. It is not synthetic.
-
 | Table | Rows | Key fields |
 |---|---|---|
-| `freMTPL2freq` | 678,013 | `PolicyID`, `Exposure`, `ClaimNb`, driver/vehicle covariates |
-| `freMTPL2sev` | 26,639 | `PolicyID`, `ClaimAmount` (one row per claim) |
+| `freMTPL2freq` | 678,013 | `IDpol`, `Exposure`, `ClaimNb`, driver/vehicle covariates |
+| `freMTPL2sev` | 26,639 | `IDpol`, `ClaimAmount` (one row per claim) |
 
 **Key variables:**
 
-- `Exposure` — fraction of year the policy was active (0–1). **Critical for modelling.**
+- `Exposure` — fraction of year the policy was active (0–1).
 - `ClaimNb` — number of claims in the exposure period
 - `ClaimAmount` — individual claim payment
 - `BonusMalus` — experience-rated score; a proxy for unobserved driver risk
@@ -64,28 +62,22 @@ The Tweedie single-model approach is included as a **benchmark**, but the freque
 
 ```
 freMTPL2freq + freMTPL2sev
-        │
         ▼
    01_eda.R              Exploratory analysis, exposure distribution,
                          zero-inflation, loss ratio by covariate
-        │
         ▼
    02_frequency_model.R  Poisson GLM with log(Exposure) offset
                          Overdispersion check → quasi-Poisson if needed
-        │
         ▼
    03_severity_model.R   Gamma GLM on claims-only subset
                          Claim count as weights
-        │
         ▼
    04_pure_premium.R     Multiply frequency × severity predictions
                          Compare against Tweedie GLM baseline
-        │
         ▼
    05_ensemble.R         XGBoost (reg:tweedie objective)
                          Tuned via cross-validation
                          SHAP values via {shapviz}
-        │
         ▼
    06_evaluation.R       Normalised Gini coefficient
                          Double lift chart
