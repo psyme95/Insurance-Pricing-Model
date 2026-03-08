@@ -114,23 +114,27 @@ freMTPL2freq + freMTPL2sev
 
 ## Key Results
 
-All metrics computed on the full 677,991-policy dataset. Pure premium is in €/policy-year. The freq-sev GLM and XGBoost predictions both incorporate a large loss loading of ×1.4245 to account for claims above the 99th percentile severity threshold (€16,327), which are modelled separately. The Tweedie GLM is included as a single-model baseline.
+Pure premium figures are in €/policy-year. The freq-sev GLM and Tweedie GLM incorporate a large loss loading of ×1.4245 for claims above the 99th percentile severity threshold (€16,327). Evaluation bases differ by model — see notes below.
 
 | Metric | Freq-Sev GLM | XGBoost | Tweedie GLM |
 |---|---|---|---|
-| Normalised Gini | 0.370 | **0.474** | 0.355 |
-| Top decile ratio | 6.19 | **9.04** | 8.24 |
-| Mean predicted PP | €166.36 | €161.96 | €210.76 |
-| Mean observed PP | €167.12 | €167.12 | €167.12 |
-| Portfolio ratio (pred/obs) | 0.995 | 0.969 | 1.263 |
-| Exposure-weighted MAE | €313 | **€306** | €353 |
+| Evaluation set | Full dataset (in-sample) | 20% holdout (out-of-sample) | Full dataset (in-sample) |
+| Observed loss basis | Uncapped | Capped (attritional layer) | Uncapped |
+| Normalised Gini | **0.370** | 0.350 | 0.355 |
+| Top decile ratio | 6.19 | 8.97 | 8.24 |
+| Mean predicted PP | €166.36 | €113.35 | €210.76 |
+| Mean observed PP | €167.12 | €118.07 | €167.12 |
+| Portfolio ratio (pred/obs) | **0.995** | 0.960 | 1.263 |
+| Exposure-weighted MAE | €313 | €215 | €353 |
+
+**Notes on comparability:** Gini figures are not directly comparable across models. XGBoost is evaluated out-of-sample against capped (attritional) losses — a harder and fairer test. The GLMs are evaluated in-sample against uncapped losses including the large loss loading. The XGBoost Gini of 0.350 on a held-out test set is broadly equivalent to the GLMs' in-sample Gini of ~0.37, suggesting comparable discrimination once evaluation basis is aligned.
 
 **Key findings:**
 
-- **XGBoost achieves the best discrimination** (normalised Gini 0.474), outperforming the freq-sev GLM by 10.4 Gini points. This reflects XGBoost's ability to capture non-linear interactions — particularly between `BonusMalus`, `DrivAge`, and `VehAge` — that the additive GLM cannot represent without explicit interaction terms.
-- **The freq-sev GLM is well-calibrated** at portfolio level (ratio 0.995) and performs competitively on MAE. Its transparency and decomposability (separate frequency and severity outputs) make it the preferred model in a regulatory or actuarial review context.
-- **The Tweedie GLM overpredicts** by 26.3% (ratio 1.263) and has the weakest Gini and MAE. The variance power parameter was fixed at *p* = 1.5 rather than estimated via profile likelihood; fitting *p* is a clear next step.
-- **Double lift chart:** the freq-sev GLM shows a ratio of 1.73 in decile 9, indicating systematic underpricing of a mid-high risk segment (concentrated in urban Area B policies). XGBoost resolves this but overpredicts the lowest-risk decile (ratio 0.59), a common tree model artefact driven by minimum leaf node predictions.
+- **The freq-sev GLM is well-calibrated** at portfolio level (ratio 0.995) and the most interpretable model. Its transparency and decomposability — separate frequency and severity outputs — make it the preferred model in a regulatory or actuarial review context.
+- **XGBoost has superior segment-level calibration.** Its double lift chart is flat across all deciles (ratios 0.89–1.20 with no systematic pattern). The freq-sev GLM shows a ratio of 1.73 in decile 9 — a 73% underprice in a specific mid-high risk segment concentrated in urban Area B policies. In a live book, this segment would be loss-making and would drive adverse selection.
+- **The Tweedie GLM overpredicts** by 26.3% (ratio 1.263) and is outperformed on all metrics. The variance power parameter was fixed at *p* = 1.5 rather than estimated via profile likelihood; this is the primary driver of miscalibration and is a clear next step.
+- **In production**, the freq-sev GLM would be the filed rating model. XGBoost would serve as a challenge model to identify segments where the GLM misprices — as demonstrated by the decile 9 finding.
 
 **Concentration curves and double lift chart:**
 
@@ -178,6 +182,7 @@ A log of non-trivial modelling choices and their justifications:
 
 ## Limitations & Next Steps
 
+- **Evaluation methodology**: The GLMs are evaluated in-sample (fitted and assessed on the full dataset). A three-way train/validation/test split would give unbiased out-of-sample GLM metrics. XGBoost uses a 20% holdout but early stopping was performed on the same test set, introducing a minor optimism bias in rounds selection; a dedicated validation set would eliminate this.
 - **Spatial structure**: Region is treated as a fixed effect. A spatial random effect (e.g. via `mgcv::gam` with a Markov random field smoother) would better capture geographic risk variation.
 - **Unobserved heterogeneity**: BonusMalus is a useful proxy but a mixed-effects model (e.g. random intercept by Region) would more formally account for clustering.
 - **Temporal effects**: The dataset has no policy year field, so trend modelling is not possible here. In production, loss development and trend adjustments are standard.
@@ -192,23 +197,28 @@ This project uses [`renv`](https://rstudio.github.io/renv/) for reproducibility.
 
 ```r
 # 1. Clone the repo
-# 2. Open the .Rproj file in RStudio
-# 3. Restore the package environment
+# 2. Open the .Rproj file in RStudio (sets working directory to project root)
+
+# 3. Install CASdatasets from its own repository BEFORE restoring the renv environment
+#    (renv cannot resolve this package automatically as it is not on CRAN)
+install.packages("CASdatasets", repos = "http://cas.uqam.ca/pub/R/")
+
+# 4. Restore the package environment
 renv::restore()
 
-# 4. Run scripts in order
+# 5. Run scripts in order
 source("R/01_eda.R")
 source("R/02_frequency_model.R")
 source("R/03_severity_model.R")
 source("R/04_pure_premium.R")
-source("R/05_ensemble.R")
+source("R/05_ensemble.R")   # saves outputs/data/test_idx.rds — required by script 06
 source("R/06_evaluation.R")
 ```
 
-Figures are written to `outputs/figures/`. Model objects are saved to `outputs/models/` (gitignored due to size).
+Figures are written to `outputs/figures/`. Model objects are saved to `outputs/models/` (gitignored due to size). `outputs/data/test_idx.rds` is saved by script 05 and must exist before running script 06.
 
-**R version:** 4.3+  
-**Key packages:** `tidyverse`, `CASdatasets`, `xgboost`, `shapviz`, `ineq`, `mgcv`, `broom`, `patchwork`
+**R version:** 4.5.1  
+**Key packages:** `tidyverse`, `CASdatasets`, `xgboost`, `shapviz`, `broom`, `patchwork`, `scales`
 
 ---
 
@@ -231,11 +241,12 @@ insurance-pricing-model/
 ├── outputs/
 │   ├── figures/
 │   ├── tables/
+│   ├── data/
+│   │   └── test_idx.rds         # saved by script 05, required by script 06
 │   └── models/                  # not tracked
 └── report/
     └── summary.md
 ```
 
 ---
-
 *Data source: Charpentier, A. (ed.) Computational Actuarial Science with R. CRC Press, 2014. Dataset available via the `CASdatasets` package.*
