@@ -142,8 +142,11 @@ cat("\nFeatures:", paste(features, collapse = ", "), "\n")
 
 set.seed(42)
 train_idx <- sample(nrow(dat), size = floor(0.8 * nrow(dat)))
+test_idx  <- setdiff(seq_len(nrow(dat)), train_idx)
 dat_train <- dat[train_idx, ]
-dat_test  <- dat[-train_idx, ]
+dat_test  <- dat[test_idx, ]
+
+saveRDS(test_idx, "outputs/data/test_idx.rds")
 
 cat(sprintf("Train: %d policies (%.1f%% claim rate)\n",
             nrow(dat_train), 100 * mean(dat_train$HasClaim)))

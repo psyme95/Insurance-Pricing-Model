@@ -4,11 +4,10 @@
 #
 # Objectives:
 #   1. Load all model predictions and assemble evaluation dataset
-#   2. Apply large loss loading to XGBoost predictions (matching script 04)
-#   3. Compute normalised Gini coefficient for each model
-#   4. Produce double lift chart (key actuarial diagnostic)
-#   5. Calibration by predicted decile — all three models
-#   6. Summary comparison table
+#   2. Compute normalised Gini coefficient for each model
+#   3. Produce double lift chart (key actuarial diagnostic)
+#   4. Calibration by predicted decile — all three models
+#   5. Summary comparison table
 #
 # Evaluation framework:
 #   Standard classification metrics (AUC, accuracy) are not appropriate
@@ -33,10 +32,34 @@
 #      Mean predicted vs mean actual pure premium within each predicted decile.
 #      Assesses absolute accuracy (not just rank-ordering).
 #
+# Evaluation basis — predicted vs observed pairing per model:
+#
+#   Freq-Sev GLM : pp_freq_sev (loaded, full PP) vs obs_pp (uncapped losses)
+#                  In-sample. GLM fitted on full dataset.
+#
+#   XGBoost      : pp_xgb (attritional, no loading) vs obs_pp_capped (capped losses)
+#                  Out-of-sample — 20% holdout test set loaded from test_idx.rds.
+#                  XGBoost was trained on capped pure premium; the large loss loading
+#                  is not applied here because observed losses are also capped.
+#                  Both predicted and observed are on the same attritional scale.
+#                  Caveat: early stopping used the test set loss to select rounds (416),
+#                  so the Gini may be very slightly optimistic. A three-way split
+#                  would eliminate this; documented as a limitation in the README.
+#
+#   Tweedie GLM  : pp_tweedie (full PP) vs obs_pp (uncapped losses)
+#                  In-sample. Tweedie GLM fitted on full dataset.
+#
+#   Note: Gini figures are not directly comparable across models because
+#   XGBoost is evaluated on a different loss basis (capped) than the GLMs
+#   (uncapped). This is the honest representation of how the models were built.
+#
 # Output files:
 #   outputs/figures/eval_*.png             — evaluation figures
 #   outputs/tables/eval_summary.csv        — model comparison table
 # =============================================================================
+
+# Set working directory to project root if running from R/ subfolder
+if (basename(getwd()) == "R") setwd("..")
 
 library(tidyverse)
 library(patchwork)
@@ -58,9 +81,9 @@ plot_theme <- function() {
 # 1. LOAD AND ASSEMBLE EVALUATION DATASET
 # =============================================================================
 
-dat        <- readRDS("outputs/data/model_data.rds")
-pp_dat     <- readRDS("outputs/data/pure_premium.rds")
-xgb_dat    <- readRDS("outputs/data/xgb_predictions.rds")
+dat     <- readRDS("outputs/data/model_data.rds")
+pp_dat  <- readRDS("outputs/data/pure_premium.rds")
+xgb_dat <- readRDS("outputs/data/xgb_predictions.rds")
 
 LARGE_LOSS_LOADING <- 1.4245  # from script 04
 
@@ -74,22 +97,37 @@ eval_dat <- dat |>
     by = "IDpol"
   ) |>
   mutate(
-    # Apply large loss loading to XGBoost (attritional → full pure premium)
-    pp_xgb_loaded  = pp_xgb * LARGE_LOSS_LOADING,
-    # Observed pure premium (full, uncapped — this is what we're trying to predict)
-    obs_pp         = TotalClaimAmount / Exposure
+    # pp_freq_sev and pp_tweedie already include the large loss loading (script 04)
+    # pp_xgb is attritional only — no loading applied here; evaluated against capped obs
+    # pp_xgb_loaded retained for reference only (not used in primary evaluation)
+    pp_xgb_loaded = pp_xgb * LARGE_LOSS_LOADING,
+    
+    # Observed PP — two versions:
+    #   obs_pp        : uncapped, used for GLM evaluation
+    #   obs_pp_capped : capped at 99th pct severity threshold, used for XGBoost evaluation
+    obs_pp        = TotalClaimAmount / Exposure,
+    obs_pp_capped = TotalClaim_capped / Exposure
   )
 
+# Load saved test indices from script 05 — guarantees identical 80/20 split.
+test_idx  <- readRDS("outputs/data/test_idx.rds")
+eval_test <- eval_dat[test_idx, ]   # XGBoost out-of-sample evaluation set
+eval_full <- eval_dat               # GLMs evaluated on full dataset (in-sample)
+
 cat("Evaluation dataset assembled.\n")
-cat(sprintf("Policies: %d\n", nrow(eval_dat)))
-cat(sprintf("Mean observed PP:              €%.2f\n",
-            weighted.mean(eval_dat$obs_pp, eval_dat$Exposure)))
-cat(sprintf("Mean freq-sev PP (loaded):     €%.2f\n",
-            weighted.mean(eval_dat$pp_freq_sev, eval_dat$Exposure)))
-cat(sprintf("Mean XGBoost PP (loaded):      €%.2f\n",
-            weighted.mean(eval_dat$pp_xgb_loaded, eval_dat$Exposure)))
-cat(sprintf("Mean Tweedie PP:               €%.2f\n",
-            weighted.mean(eval_dat$pp_tweedie, eval_dat$Exposure)))
+cat(sprintf("Full dataset:     %d policies\n", nrow(eval_full)))
+cat(sprintf("XGBoost test set: %d policies (%.0f%% holdout)\n",
+            nrow(eval_test), 100 * nrow(eval_test) / nrow(eval_full)))
+cat(sprintf("\nMean obs PP uncapped  (full):             €%.2f\n",
+            weighted.mean(eval_full$obs_pp,        eval_full$Exposure)))
+cat(sprintf("Mean obs PP capped    (test set):         €%.2f\n",
+            weighted.mean(eval_test$obs_pp_capped, eval_test$Exposure)))
+cat(sprintf("Mean freq-sev PP      (full, in-sample):  €%.2f\n",
+            weighted.mean(eval_full$pp_freq_sev,   eval_full$Exposure)))
+cat(sprintf("Mean XGBoost PP attrn (test, OOS):        €%.2f\n",
+            weighted.mean(eval_test$pp_xgb,        eval_test$Exposure)))
+cat(sprintf("Mean Tweedie PP       (full, in-sample):  €%.2f\n",
+            weighted.mean(eval_full$pp_tweedie,    eval_full$Exposure)))
 
 
 # =============================================================================
@@ -104,25 +142,19 @@ cat(sprintf("Mean Tweedie PP:               €%.2f\n",
 #   3. Compute cumulative share of actual loss (y-axis)
 #   4. Gini = 2 * (area under concentration curve - 0.5)
 #   5. Normalise by the "oracle" Gini (model with perfect predictions)
-#
-# A higher normalised Gini = better risk discrimination.
 
 gini_normalised <- function(actual, predicted, weight) {
-  # Sort by predicted (ascending)
   ord      <- order(predicted)
   actual   <- actual[ord]
   weight   <- weight[ord]
   
-  # Cumulative shares
   cum_wt   <- cumsum(weight) / sum(weight)
   cum_loss <- cumsum(actual * weight) / sum(actual * weight)
   
-  # Area under concentration curve (trapezoidal rule)
   auc <- sum(diff(c(0, cum_wt)) * (c(0, cum_loss[-length(cum_loss)]) +
                                      c(cum_loss)) / 2)
   gini_model <- 2 * auc - 1
   
-  # Oracle Gini: sort by actual loss (best possible ordering)
   ord_oracle    <- order(actual)
   actual_oracle <- actual[ord_oracle]
   weight_oracle <- weight[ord_oracle]
@@ -138,26 +170,21 @@ gini_normalised <- function(actual, predicted, weight) {
 }
 
 cat("\n--- Normalised Gini coefficients ---\n")
+cat("(XGBoost: OOS, attritional pred vs capped obs)\n")
+cat("(GLMs: in-sample, full pred vs uncapped obs)\n")
 
-gini_fs  <- gini_normalised(eval_dat$obs_pp, eval_dat$pp_freq_sev,
-                            eval_dat$Exposure)
-gini_xgb <- gini_normalised(eval_dat$obs_pp, eval_dat$pp_xgb_loaded,
-                            eval_dat$Exposure)
-gini_tw  <- gini_normalised(eval_dat$obs_pp, eval_dat$pp_tweedie,
-                            eval_dat$Exposure)
+gini_fs  <- gini_normalised(eval_full$obs_pp,        eval_full$pp_freq_sev, eval_full$Exposure)
+gini_xgb <- gini_normalised(eval_test$obs_pp_capped, eval_test$pp_xgb,      eval_test$Exposure)
+gini_tw  <- gini_normalised(eval_full$obs_pp,        eval_full$pp_tweedie,  eval_full$Exposure)
 
-cat(sprintf("Freq-Sev GLM:  %.4f\n", gini_fs))
-cat(sprintf("XGBoost:       %.4f\n", gini_xgb))
-cat(sprintf("Tweedie GLM:   %.4f\n", gini_tw))
+cat(sprintf("Freq-Sev GLM (in-sample,    uncapped obs): %.4f\n", gini_fs))
+cat(sprintf("XGBoost      (out-of-sample, capped obs):  %.4f\n", gini_xgb))
+cat(sprintf("Tweedie GLM  (in-sample,    uncapped obs): %.4f\n", gini_tw))
 
 
 # =============================================================================
 # 3. LORENZ / CONCENTRATION CURVES
 # =============================================================================
-# Visual representation of the Gini computation.
-# Each model's curve shows how well it concentrates actual losses
-# among predicted high-risk policies.
-# A curve closer to the top-left = better discrimination.
 
 lorenz_curve <- function(actual, predicted, weight, model_name) {
   ord      <- order(predicted)
@@ -172,15 +199,19 @@ lorenz_curve <- function(actual, predicted, weight, model_name) {
   )
 }
 
-# Sample for plotting speed (1% of data, preserving ordering)
-set.seed(42)
-sample_idx <- sort(sample(nrow(eval_dat), size = nrow(eval_dat) %/% 100))
-ev_s       <- eval_dat[sample_idx, ]
+set.seed(123)
+sample_full <- sort(sample(nrow(eval_full), size = nrow(eval_full) %/% 100))
+sample_test <- sort(sample(nrow(eval_test), size = nrow(eval_test) %/% 100))
+ev_full_s   <- eval_full[sample_full, ]
+ev_test_s   <- eval_test[sample_test, ]
 
 lorenz_dat <- bind_rows(
-  lorenz_curve(ev_s$obs_pp, ev_s$pp_freq_sev,    ev_s$Exposure, "Freq-Sev GLM"),
-  lorenz_curve(ev_s$obs_pp, ev_s$pp_xgb_loaded,  ev_s$Exposure, "XGBoost"),
-  lorenz_curve(ev_s$obs_pp, ev_s$pp_tweedie,      ev_s$Exposure, "Tweedie GLM")
+  lorenz_curve(ev_full_s$obs_pp,        ev_full_s$pp_freq_sev, ev_full_s$Exposure,
+               "Freq-Sev GLM (in-sample)"),
+  lorenz_curve(ev_test_s$obs_pp_capped, ev_test_s$pp_xgb,      ev_test_s$Exposure,
+               "XGBoost (out-of-sample)"),
+  lorenz_curve(ev_full_s$obs_pp,        ev_full_s$pp_tweedie,  ev_full_s$Exposure,
+               "Tweedie GLM (in-sample)")
 )
 
 p_lorenz <- ggplot(lorenz_dat,
@@ -192,25 +223,30 @@ p_lorenz <- ggplot(lorenz_dat,
   scale_x_continuous(labels = percent) +
   scale_y_continuous(labels = percent) +
   scale_colour_manual(values = c(
-    "Freq-Sev GLM" = "#2166ac",
-    "XGBoost"      = "#d6604d",
-    "Tweedie GLM"  = "#4dac26"
+    "Freq-Sev GLM (in-sample)"  = "#2166ac",
+    "XGBoost (out-of-sample)"   = "#d6604d",
+    "Tweedie GLM (in-sample)"   = "#4dac26"
   )) +
   scale_linetype_manual(values = c(
-    "Freq-Sev GLM" = "solid",
-    "XGBoost"      = "dashed",
-    "Tweedie GLM"  = "dotdash"
+    "Freq-Sev GLM (in-sample)"  = "solid",
+    "XGBoost (out-of-sample)"   = "dashed",
+    "Tweedie GLM (in-sample)"   = "dotdash"
   )) +
   annotate("text", x = 0.65, y = 0.35, label = "Random (Gini = 0)",
            colour = "grey50", size = 3.2, angle = 35) +
   labs(
     title    = "Concentration Curves — Risk Discrimination",
     subtitle = sprintf(
-      "Normalised Gini: Freq-Sev = %.3f | XGBoost = %.3f | Tweedie = %.3f",
+      "Normalised Gini: Freq-Sev = %.3f (IS) | XGBoost = %.3f (OOS) | Tweedie = %.3f (IS)",
       gini_fs, gini_xgb, gini_tw),
     x        = "Cumulative share of exposure (sorted by predicted risk)",
     y        = "Cumulative share of actual loss",
-    colour   = NULL, linetype = NULL
+    colour   = NULL, linetype = NULL,
+    caption  = paste(
+      "GLMs: in-sample, uncapped observed losses.",
+      "XGBoost: out-of-sample 20% holdout, capped observed losses.",
+      "Gini figures not directly comparable across models."
+    )
   ) +
   plot_theme() +
   theme(legend.position = "bottom")
@@ -222,42 +258,34 @@ ggsave("outputs/figures/eval_lorenz.png", p_lorenz,
 # =============================================================================
 # 4. DOUBLE LIFT CHART
 # =============================================================================
-# The double lift chart is the primary actuarial diagnostic for pricing models.
-#
-# Construction:
-#   1. Sort policies by predicted pure premium
-#   2. Bin into deciles
-#   3. For each decile: compute actual / predicted loss ratio
-#   4. Plot ratio by decile — flat line at 1.0 = perfect calibration
-#
-# A well-behaved model should show:
-#   - Ratios close to 1.0 across all deciles
-#   - No systematic over/underprediction at either tail
-#   - The highest decile (most predicted risk) should have ratio near 1.0
+# obs_col argument allows each model to be compared against its own
+# appropriate observed loss basis.
 
-double_lift <- function(data, pred_col, model_name, n_bins = 10) {
+double_lift <- function(data, pred_col, model_name, obs_col = "obs_pp", n_bins = 10) {
   data |>
     mutate(pred_decile = ntile(.data[[pred_col]], n_bins)) |>
     group_by(pred_decile) |>
     summarise(
-      exposure   = sum(Exposure),
-      obs_loss   = sum(TotalClaimAmount),
-      pred_loss  = sum(.data[[pred_col]] * Exposure),
-      obs_pp     = obs_loss / exposure,
-      pred_pp    = pred_loss / exposure,
-      ratio      = obs_loss / pred_loss,
-      .groups    = "drop"
+      exposure  = sum(Exposure),
+      obs_loss  = sum(.data[[obs_col]] * Exposure),
+      pred_loss = sum(.data[[pred_col]] * Exposure),
+      obs_pp    = obs_loss / exposure,
+      pred_pp   = pred_loss / exposure,
+      ratio     = obs_loss / pred_loss,
+      .groups   = "drop"
     ) |>
     mutate(model = model_name)
 }
 
-dl_fs  <- double_lift(eval_dat, "pp_freq_sev",    "Freq-Sev GLM")
-dl_xgb <- double_lift(eval_dat, "pp_xgb_loaded",  "XGBoost")
-dl_tw  <- double_lift(eval_dat, "pp_tweedie",      "Tweedie GLM")
+cat("\n--- Double lift ratios by decile ---\n")
+cat("(XGBoost: OOS, attritional vs capped obs | GLMs: in-sample vs uncapped obs)\n")
+
+dl_fs  <- double_lift(eval_full, "pp_freq_sev", "Freq-Sev GLM (in-sample)",  obs_col = "obs_pp")
+dl_xgb <- double_lift(eval_test, "pp_xgb",      "XGBoost (out-of-sample)",   obs_col = "obs_pp_capped")
+dl_tw  <- double_lift(eval_full, "pp_tweedie",   "Tweedie GLM (in-sample)",   obs_col = "obs_pp")
 
 dl_all <- bind_rows(dl_fs, dl_xgb, dl_tw)
 
-cat("\n--- Double lift ratios by decile ---\n")
 dl_all |>
   select(model, pred_decile, obs_pp, pred_pp, ratio) |>
   print(n = 30)
@@ -271,21 +299,25 @@ p_dl <- ggplot(dl_all,
   geom_point(size = 2.5) +
   scale_x_continuous(breaks = 1:10) +
   scale_colour_manual(values = c(
-    "Freq-Sev GLM" = "#2166ac",
-    "XGBoost"      = "#d6604d",
-    "Tweedie GLM"  = "#4dac26"
+    "Freq-Sev GLM (in-sample)"  = "#2166ac",
+    "XGBoost (out-of-sample)"   = "#d6604d",
+    "Tweedie GLM (in-sample)"   = "#4dac26"
   )) +
   scale_linetype_manual(values = c(
-    "Freq-Sev GLM" = "solid",
-    "XGBoost"      = "dashed",
-    "Tweedie GLM"  = "dotdash"
+    "Freq-Sev GLM (in-sample)"  = "solid",
+    "XGBoost (out-of-sample)"   = "dashed",
+    "Tweedie GLM (in-sample)"   = "dotdash"
   )) +
   labs(
     title    = "Double Lift Chart — Actual / Predicted Loss Ratio by Decile",
     subtitle = "Dashed line = perfect calibration (ratio = 1.0). Sorted by each model's predicted risk.",
     x        = "Predicted pure premium decile (1 = lowest risk)",
     y        = "Actual / predicted loss ratio",
-    colour   = NULL, linetype = NULL
+    colour   = NULL, linetype = NULL,
+    caption  = paste(
+      "GLMs: in-sample, uncapped observed losses.",
+      "XGBoost: out-of-sample 20% holdout, capped observed losses (attritional layer only)."
+    )
   ) +
   plot_theme() +
   theme(legend.position = "bottom")
@@ -297,15 +329,13 @@ ggsave("outputs/figures/eval_double_lift.png", p_dl,
 # =============================================================================
 # 5. CALIBRATION BY DECILE
 # =============================================================================
-# Absolute calibration: predicted vs actual pure premium within each decile.
-# Complements the double lift chart — shows not just ratio but scale.
 
-calib_plot <- function(data, pred_col, model_name, n_bins = 10) {
+calib_plot <- function(data, pred_col, model_name, obs_col = "obs_pp", n_bins = 10) {
   data |>
     mutate(pred_decile = ntile(.data[[pred_col]], n_bins)) |>
     group_by(pred_decile) |>
     summarise(
-      obs_pp  = sum(TotalClaimAmount) / sum(Exposure),
+      obs_pp  = weighted.mean(.data[[obs_col]], Exposure),
       pred_pp = weighted.mean(.data[[pred_col]], Exposure),
       .groups = "drop"
     ) |>
@@ -318,9 +348,9 @@ calib_plot <- function(data, pred_col, model_name, n_bins = 10) {
 }
 
 calib_all <- bind_rows(
-  calib_plot(eval_dat, "pp_freq_sev",   "Freq-Sev GLM"),
-  calib_plot(eval_dat, "pp_xgb_loaded", "XGBoost"),
-  calib_plot(eval_dat, "pp_tweedie",    "Tweedie GLM")
+  calib_plot(eval_full, "pp_freq_sev", "Freq-Sev GLM (in-sample)",  obs_col = "obs_pp"),
+  calib_plot(eval_test, "pp_xgb",      "XGBoost (out-of-sample)",   obs_col = "obs_pp_capped"),
+  calib_plot(eval_full, "pp_tweedie",  "Tweedie GLM (in-sample)",   obs_col = "obs_pp")
 )
 
 p_calib <- ggplot(calib_all,
@@ -331,16 +361,18 @@ p_calib <- ggplot(calib_all,
   facet_wrap(~ model, ncol = 3) +
   scale_x_continuous(breaks = 1:10) +
   scale_y_continuous(labels = comma) +
-  scale_colour_manual(values = c("Observed" = "#d6604d",
-                                 "Predicted" = "#2166ac")) +
-  scale_linetype_manual(values = c("Observed" = "dotted",
-                                   "Predicted" = "solid")) +
+  scale_colour_manual(values = c("Observed" = "#d6604d", "Predicted" = "#2166ac")) +
+  scale_linetype_manual(values = c("Observed" = "dotted", "Predicted" = "solid")) +
   labs(
     title    = "Calibration by Predicted Decile — All Models",
     subtitle = "Observed vs predicted pure premium. Lines should overlap.",
     x        = "Predicted decile (1 = lowest risk)",
     y        = "Pure premium (€/year)",
-    colour   = NULL, linetype = NULL
+    colour   = NULL, linetype = NULL,
+    caption  = paste(
+      "GLMs: uncapped observed losses.",
+      "XGBoost: capped observed losses (attritional layer only, no large loss loading)."
+    )
   ) +
   plot_theme() +
   theme(
@@ -355,9 +387,9 @@ ggsave("outputs/figures/eval_calibration.png", p_calib,
 # =============================================================================
 # 6. TOP DECILE RATIO
 # =============================================================================
-# The top decile ratio (TDR) summarises discrimination in a single number:
-# the ratio of mean predicted pure premium in the top decile vs the bottom.
-# Higher TDR = model identifies a wider spread between high and low risk.
+# Ratio of mean predicted PP in decile 10 vs decile 1.
+# Measures spread between highest and lowest predicted risk.
+# Computed on predicted values only — same basis across all models.
 
 tdr <- function(data, pred_col) {
   deciles <- data |>
@@ -368,34 +400,32 @@ tdr <- function(data, pred_col) {
   deciles$pred_pp[10] / deciles$pred_pp[1]
 }
 
-tdr_fs  <- tdr(eval_dat, "pp_freq_sev")
-tdr_xgb <- tdr(eval_dat, "pp_xgb_loaded")
-tdr_tw  <- tdr(eval_dat, "pp_tweedie")
-
 cat("\n--- Top decile ratios ---\n")
-cat(sprintf("Freq-Sev GLM:  %.2f\n", tdr_fs))
-cat(sprintf("XGBoost:       %.2f\n", tdr_xgb))
-cat(sprintf("Tweedie GLM:   %.2f\n", tdr_tw))
+
+tdr_fs  <- tdr(eval_full, "pp_freq_sev")
+tdr_xgb <- tdr(eval_test, "pp_xgb")
+tdr_tw  <- tdr(eval_full, "pp_tweedie")
+
+cat(sprintf("Freq-Sev GLM (in-sample):     %.2f\n", tdr_fs))
+cat(sprintf("XGBoost      (out-of-sample):  %.2f\n", tdr_xgb))
+cat(sprintf("Tweedie GLM  (in-sample):     %.2f\n", tdr_tw))
 
 
 # =============================================================================
-# 7. MEAN ABSOLUTE ERROR BY SEGMENT
+# 7. MEAN ABSOLUTE ERROR
 # =============================================================================
-# MAE on the pure premium scale, exposure-weighted.
-# Note: MAE is less meaningful than Gini for pricing but useful for
-# communicating model accuracy to non-actuarial stakeholders.
 
 wmae <- function(actual, predicted, weight) {
   weighted.mean(abs(actual - predicted), weight)
 }
 
 cat("\n--- Exposure-weighted MAE ---\n")
-cat(sprintf("Freq-Sev GLM:  €%.2f\n",
-            wmae(eval_dat$obs_pp, eval_dat$pp_freq_sev,   eval_dat$Exposure)))
-cat(sprintf("XGBoost:       €%.2f\n",
-            wmae(eval_dat$obs_pp, eval_dat$pp_xgb_loaded, eval_dat$Exposure)))
-cat(sprintf("Tweedie GLM:   €%.2f\n",
-            wmae(eval_dat$obs_pp, eval_dat$pp_tweedie,     eval_dat$Exposure)))
+cat(sprintf("Freq-Sev GLM (in-sample,    uncapped obs): €%.2f\n",
+            wmae(eval_full$obs_pp,        eval_full$pp_freq_sev, eval_full$Exposure)))
+cat(sprintf("XGBoost      (out-of-sample, capped obs):  €%.2f\n",
+            wmae(eval_test$obs_pp_capped, eval_test$pp_xgb,      eval_test$Exposure)))
+cat(sprintf("Tweedie GLM  (in-sample,    uncapped obs): €%.2f\n",
+            wmae(eval_full$obs_pp,        eval_full$pp_tweedie,  eval_full$Exposure)))
 
 
 # =============================================================================
@@ -403,24 +433,33 @@ cat(sprintf("Tweedie GLM:   €%.2f\n",
 # =============================================================================
 
 summary_tab <- tibble(
-  Model = c("Freq-Sev GLM", "XGBoost", "Tweedie GLM"),
+  Model            = c("Freq-Sev GLM", "XGBoost", "Tweedie GLM"),
+  Eval_set         = c("In-sample", "Out-of-sample (20% holdout)", "In-sample"),
+  Obs_basis        = c("Uncapped losses", "Capped losses (attritional)", "Uncapped losses"),
   Mean_predicted_PP = c(
-    round(weighted.mean(eval_dat$pp_freq_sev,   eval_dat$Exposure), 2),
-    round(weighted.mean(eval_dat$pp_xgb_loaded, eval_dat$Exposure), 2),
-    round(weighted.mean(eval_dat$pp_tweedie,     eval_dat$Exposure), 2)
+    round(weighted.mean(eval_full$pp_freq_sev, eval_full$Exposure), 2),
+    round(weighted.mean(eval_test$pp_xgb,      eval_test$Exposure), 2),
+    round(weighted.mean(eval_full$pp_tweedie,  eval_full$Exposure), 2)
   ),
-  Mean_observed_PP = round(weighted.mean(eval_dat$obs_pp, eval_dat$Exposure), 2),
+  Mean_observed_PP = c(
+    round(weighted.mean(eval_full$obs_pp,        eval_full$Exposure), 2),
+    round(weighted.mean(eval_test$obs_pp_capped, eval_test$Exposure), 2),
+    round(weighted.mean(eval_full$obs_pp,        eval_full$Exposure), 2)
+  ),
   Ratio = round(c(
-    weighted.mean(eval_dat$pp_freq_sev,   eval_dat$Exposure),
-    weighted.mean(eval_dat$pp_xgb_loaded, eval_dat$Exposure),
-    weighted.mean(eval_dat$pp_tweedie,     eval_dat$Exposure)
-  ) / weighted.mean(eval_dat$obs_pp, eval_dat$Exposure), 4),
-  Normalised_Gini = round(c(gini_fs, gini_xgb, gini_tw), 4),
+    weighted.mean(eval_full$pp_freq_sev, eval_full$Exposure) /
+      weighted.mean(eval_full$obs_pp,        eval_full$Exposure),
+    weighted.mean(eval_test$pp_xgb,      eval_test$Exposure) /
+      weighted.mean(eval_test$obs_pp_capped, eval_test$Exposure),
+    weighted.mean(eval_full$pp_tweedie,  eval_full$Exposure) /
+      weighted.mean(eval_full$obs_pp,        eval_full$Exposure)
+  ), 4),
+  Normalised_Gini  = round(c(gini_fs, gini_xgb, gini_tw), 4),
   Top_Decile_Ratio = round(c(tdr_fs, tdr_xgb, tdr_tw), 2),
   WMAE = round(c(
-    wmae(eval_dat$obs_pp, eval_dat$pp_freq_sev,   eval_dat$Exposure),
-    wmae(eval_dat$obs_pp, eval_dat$pp_xgb_loaded, eval_dat$Exposure),
-    wmae(eval_dat$obs_pp, eval_dat$pp_tweedie,     eval_dat$Exposure)
+    wmae(eval_full$obs_pp,        eval_full$pp_freq_sev, eval_full$Exposure),
+    wmae(eval_test$obs_pp_capped, eval_test$pp_xgb,      eval_test$Exposure),
+    wmae(eval_full$obs_pp,        eval_full$pp_tweedie,  eval_full$Exposure)
   ), 2)
 )
 
